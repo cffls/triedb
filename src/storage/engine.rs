@@ -243,8 +243,8 @@ impl StorageEngine {
         if remaining_path.is_empty() {
             // cache the account location if it is a contract account
             if let TrieValue::Account(account) = node.value()? {
-                if account.storage_root != EMPTY_ROOT_HASH &&
-                    original_path.len() == ADDRESS_PATH_LENGTH
+                if account.storage_root != EMPTY_ROOT_HASH
+                    && original_path.len() == ADDRESS_PATH_LENGTH
                 {
                     context
                         .contract_account_loc_cache
@@ -544,8 +544,8 @@ impl StorageEngine {
 
         // Ensure page has enough space for a new branch, a new cell pointer for the new branch,
         // while taking into account the space saving from shrinking the existing node's prefix.
-        if slotted_page.num_free_bytes() <
-            new_parent_branch.size() + CELL_POINTER_SIZE - common_prefix.len() / 2
+        if slotted_page.num_free_bytes()
+            < new_parent_branch.size() + CELL_POINTER_SIZE - common_prefix.len() / 2
         {
             self.split_page(context, slotted_page)?;
             return Err(Error::PageSplit(0));
@@ -981,8 +981,8 @@ impl StorageEngine {
                 // 3. and add new cell pointer for the new leaf node (3 bytes)
                 // when adding the new child, split the page.
                 // FIXME: is it safe to split the page here if we've already modified the page?
-                if slotted_page.num_free_bytes() <
-                    node_size_incr + new_node.size() + CELL_POINTER_SIZE
+                if slotted_page.num_free_bytes()
+                    < node_size_incr + new_node.size() + CELL_POINTER_SIZE
                 {
                     self.split_page(context, slotted_page)?;
                     return Err(Error::PageSplit(0));
@@ -1390,12 +1390,15 @@ fn move_subtrie_nodes(
     target_page: &mut SlottedPageMut<'_>,
 ) -> Result<Location, Error> {
     let node: Node = source_page.get_value(root_index)?;
-    source_page.delete_value(root_index)?;
-
     let has_children = node.has_children();
 
-    // first insert the node into the new page to secure its location.
+    // Insert into target page FIRST, before deleting from source.
+    // This ensures that if insert_value fails (e.g., target page is full),
+    // the source page remains intact and no corruption occurs.
     let new_index = target_page.insert_value(&node)?;
+
+    // Only delete from source after successful insert into target
+    source_page.delete_value(root_index)?;
 
     // if the node has no children, we're done.
     if !has_children {
@@ -3813,5 +3816,140 @@ mod tests {
             "parent page {parent_page_id} is not in the orphan page list"
         );
         assert_eq!(count, 4, "Expected 4 orphan pages after the delete operation");
+    }
+
+    /// Test that move_subtrie_nodes does not corrupt the source page when the target page is full.
+    ///
+    /// This test verifies the fix for a bug where move_subtrie_nodes would delete a node from
+    /// the source page BEFORE attempting to insert it into the target page. If the insert failed
+    /// (e.g., target page full), the source page would be left in a corrupted state with:
+    /// - num_cells decremented (cell deleted)
+    /// - But parent pointers still referencing the deleted cell
+    ///
+    /// The fix ensures we insert into the target page first, and only delete from the source
+    /// after a successful insert.
+    #[test]
+    fn test_move_subtrie_nodes_does_not_corrupt_source_on_insert_failure() {
+        use crate::path::RawPath;
+
+        let (storage_engine, mut context) = create_test_engine(300);
+
+        // Step 1: Create source page with a large node that we'll try to move
+        let source_page = storage_engine.allocate_page(&mut context).unwrap();
+        let mut source_slotted_page = SlottedPageMut::try_from(source_page).unwrap();
+
+        // Create first leaf node (will be at cell 0) - small node
+        let leaf1_nibbles: [u8; 4] = [1, 2, 3, 4];
+        let leaf1_account = create_test_account(100, 1);
+        let leaf1_node = Node::new_leaf(
+            &RawPath::from_nibbles(&leaf1_nibbles),
+            &TrieValue::Account(leaf1_account),
+        )
+        .unwrap();
+        let leaf1_index = source_slotted_page.insert_value(&leaf1_node).unwrap();
+        assert_eq!(leaf1_index, 0);
+
+        // Create second leaf node (will be at cell 1) - this is a LARGE node we'll try to move
+        // Use a long prefix to make the node large
+        let leaf2_nibbles: [u8; 60] = [5; 60];
+        let leaf2_account = create_test_account(200, 2);
+        let leaf2_node = Node::new_leaf(
+            &RawPath::from_nibbles(&leaf2_nibbles),
+            &TrieValue::Account(leaf2_account),
+        )
+        .unwrap();
+        let leaf2_size = leaf2_node.size();
+        let leaf2_index = source_slotted_page.insert_value(&leaf2_node).unwrap();
+        assert_eq!(leaf2_index, 1);
+
+        // Record the state before the move attempt
+        let num_cells_before = source_slotted_page.num_occupied_cells();
+        assert_eq!(num_cells_before, 2, "Should have 2 cells before move attempt");
+
+        // Verify we can read the node at cell 1
+        let _node_before: Node = source_slotted_page.get_value(1).unwrap();
+
+        drop(source_slotted_page);
+
+        // Step 2: Create target page and fill it until there's not enough space for the large node
+        let target_page = storage_engine.allocate_page(&mut context).unwrap();
+        let mut target_slotted_page = SlottedPageMut::try_from(target_page).unwrap();
+
+        // Fill the target page until we have less free space than the node we want to move
+        // We need strictly less space (accounting for cell pointer overhead)
+        let mut fill_count: u64 = 0;
+        while target_slotted_page.num_free_bytes() > leaf2_size {
+            // Nibbles must be 0-15, so we use modulo 16
+            let mut fill_nibbles = [0u8; 60];
+            fill_nibbles[0] = (fill_count % 16) as u8;
+            fill_nibbles[1] = ((fill_count / 16) % 16) as u8;
+            fill_nibbles[2] = ((fill_count / 256) % 16) as u8;
+            let fill_account = create_test_account(fill_count * 1000, fill_count);
+            let fill_node = Node::new_leaf(
+                &RawPath::from_nibbles(&fill_nibbles),
+                &TrieValue::Account(fill_account),
+            )
+            .unwrap();
+
+            // Try to insert
+            if target_slotted_page.insert_value(&fill_node).is_err() {
+                break;
+            }
+            fill_count += 1;
+
+            // Safety limit
+            if fill_count > 200 {
+                break;
+            }
+        }
+
+        // Verify that the target page doesn't have enough space for the large node
+        // Note: insert_value needs space for the node + cell pointer (3 bytes)
+        let target_free_bytes = target_slotted_page.num_free_bytes();
+        assert!(
+            target_free_bytes <= leaf2_size,
+            "Target page should have at most {} free bytes (node size), but has {}",
+            leaf2_size,
+            target_free_bytes
+        );
+
+        drop(target_slotted_page);
+
+        // Step 3: Try to move the large node from source cell 1 to the nearly-full target page
+        let source_page = storage_engine.get_mut_page(&context, page_id!(1)).unwrap();
+        let mut source_slotted_page = SlottedPageMut::try_from(source_page).unwrap();
+
+        let target_page = storage_engine.get_mut_page(&context, page_id!(2)).unwrap();
+        let mut target_slotted_page = SlottedPageMut::try_from(target_page).unwrap();
+
+        // This should fail because the target page doesn't have enough space for the large node
+        let result = move_subtrie_nodes(&mut source_slotted_page, 1, &mut target_slotted_page);
+
+        // Step 4: Verify the result
+        // The move should fail because target doesn't have enough space
+        assert!(
+            result.is_err(),
+            "Move should fail when target page doesn't have enough space for the node"
+        );
+
+        // CRITICAL: Verify source page is NOT corrupted
+        // With the bug (delete before insert): num_cells would be 1, cell 1 would be gone
+        // With the fix (insert before delete): num_cells should still be 2, cell 1 should exist
+
+        let num_cells_after = source_slotted_page.num_occupied_cells();
+        assert_eq!(
+            num_cells_after, num_cells_before,
+            "Source page num_cells should be unchanged after failed move. \
+             Before: {}, After: {}. If num_cells decreased, the bug is present!",
+            num_cells_before, num_cells_after
+        );
+
+        // Verify we can still read the node at cell 1
+        let node_after_result: Result<Node, _> = source_slotted_page.get_value(1);
+        assert!(
+            node_after_result.is_ok(),
+            "Should still be able to read node at cell 1 after failed move. \
+             If this fails with InvalidCellPointer, the bug is present!"
+        );
     }
 }
