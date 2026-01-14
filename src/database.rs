@@ -5,7 +5,7 @@ use crate::{
     metrics::DatabaseMetrics,
     page::{PageError, PageId, PageManager},
     storage::engine::{self, StorageEngine},
-    transaction::{Transaction, TransactionError, TransactionManager, RO, RW},
+    transaction::{Transaction, TransactionError, TransactionManager, UpgradableTransaction, RO, RW},
 };
 use alloy_primitives::B256;
 use parking_lot::Mutex;
@@ -227,6 +227,14 @@ impl Database {
         begin_rw(self)
     }
 
+    /// Creates an upgradable transaction that starts without a write lock.
+    ///
+    /// This transaction type allows you to accumulate changes, compute the state root
+    /// (which acquires the write lock), and then either commit (fast) or abort.
+    pub fn begin_upgradable(&self) -> UpgradableTransaction<&Self> {
+        begin_upgradable(self)
+    }
+
     pub fn state_root(&self) -> B256 {
         self.storage_engine.read_context().root_node_hash
     }
@@ -279,6 +287,14 @@ pub fn begin_rw<DB: Deref<Target = Database>>(
         db.storage_engine.unlock(min_snapshot_id - 1);
     }
     Ok(Transaction::new(context, db))
+}
+
+/// Creates an upgradable transaction that starts without a write lock.
+///
+/// This transaction type allows you to accumulate changes, compute the state root
+/// (which acquires the write lock), and then either commit (fast) or abort.
+pub fn begin_upgradable<DB: Deref<Target = Database>>(db: DB) -> UpgradableTransaction<DB> {
+    UpgradableTransaction::new(db)
 }
 
 #[cfg(test)]
@@ -610,5 +626,121 @@ mod tests {
         let mut tx = begin_ro(db_arc).unwrap();
         let account = tx.get_account(&AddressPath::for_address(address)).unwrap().unwrap();
         assert_eq!(account, Account::new(1, U256::from(100), EMPTY_ROOT_HASH, KECCAK_EMPTY));
+    }
+
+    #[test]
+    fn test_upgradable_transaction_commit() {
+        let tmp_dir = TempDir::new("test_db").unwrap();
+        let file_path = tmp_dir.path().join("test.db");
+        let db = Database::create_new(&file_path).unwrap();
+
+        let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let account = Account::new(1, U256::from(100), EMPTY_ROOT_HASH, KECCAK_EMPTY);
+
+        // Use upgradable transaction
+        let mut tx = db.begin_upgradable();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
+            .unwrap();
+
+        // Compute root (acquires write lock)
+        let computed_root = tx.compute_root().unwrap();
+        assert_ne!(computed_root, EMPTY_ROOT_HASH);
+
+        // Commit (just persists, no recomputation)
+        tx.commit().unwrap();
+
+        // Verify data was persisted
+        let mut ro_tx = db.begin_ro().unwrap();
+        let read_account = ro_tx.get_account(&AddressPath::for_address(address)).unwrap().unwrap();
+        assert_eq!(read_account, account);
+
+        // Verify state root matches
+        assert_eq!(db.state_root(), computed_root);
+    }
+
+    #[test]
+    fn test_upgradable_transaction_abort() {
+        let tmp_dir = TempDir::new("test_db").unwrap();
+        let file_path = tmp_dir.path().join("test.db");
+        let db = Database::create_new(&file_path).unwrap();
+
+        let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let account = Account::new(1, U256::from(100), EMPTY_ROOT_HASH, KECCAK_EMPTY);
+
+        // Get initial state root
+        let initial_root = db.state_root();
+
+        // Use upgradable transaction
+        let mut tx = db.begin_upgradable();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
+            .unwrap();
+
+        // Compute root (acquires write lock)
+        let computed_root = tx.compute_root().unwrap();
+        assert_ne!(computed_root, initial_root);
+
+        // Abort (discards changes)
+        tx.abort().unwrap();
+
+        // Verify data was NOT persisted
+        let mut ro_tx = db.begin_ro().unwrap();
+        let read_account = ro_tx.get_account(&AddressPath::for_address(address)).unwrap();
+        assert!(read_account.is_none());
+
+        // Verify state root is unchanged
+        assert_eq!(db.state_root(), initial_root);
+    }
+
+    #[test]
+    fn test_upgradable_transaction_abort_before_compute() {
+        let tmp_dir = TempDir::new("test_db").unwrap();
+        let file_path = tmp_dir.path().join("test.db");
+        let db = Database::create_new(&file_path).unwrap();
+
+        let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let account = Account::new(1, U256::from(100), EMPTY_ROOT_HASH, KECCAK_EMPTY);
+
+        // Use upgradable transaction
+        let mut tx = db.begin_upgradable();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
+            .unwrap();
+
+        // Abort before compute_root (no write lock was acquired)
+        tx.abort().unwrap();
+
+        // Verify data was NOT persisted
+        let mut ro_tx = db.begin_ro().unwrap();
+        let read_account = ro_tx.get_account(&AddressPath::for_address(address)).unwrap();
+        assert!(read_account.is_none());
+    }
+
+    #[test]
+    fn test_upgradable_transaction_compare_with_rw() {
+        let tmp_dir = TempDir::new("test_db").unwrap();
+
+        // Create two databases with same data
+        let db1_path = tmp_dir.path().join("test1.db");
+        let db2_path = tmp_dir.path().join("test2.db");
+        let db1 = Database::create_new(&db1_path).unwrap();
+        let db2 = Database::create_new(&db2_path).unwrap();
+
+        let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let account = Account::new(1, U256::from(100), EMPTY_ROOT_HASH, KECCAK_EMPTY);
+
+        // Use regular RW transaction on db1
+        let mut tx1 = db1.begin_rw().unwrap();
+        tx1.set_account(AddressPath::for_address(address), Some(account.clone()))
+            .unwrap();
+        tx1.commit().unwrap();
+
+        // Use upgradable transaction on db2
+        let mut tx2 = db2.begin_upgradable();
+        tx2.set_account(AddressPath::for_address(address), Some(account.clone()))
+            .unwrap();
+        tx2.compute_root().unwrap();
+        tx2.commit().unwrap();
+
+        // Both databases should have the same state root
+        assert_eq!(db1.state_root(), db2.state_root());
     }
 }

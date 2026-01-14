@@ -27,3 +27,4 @@ pub mod transaction;
 
 pub use database::Database;
 pub use page::PageManager;
+pub use transaction::UpgradableTransaction;

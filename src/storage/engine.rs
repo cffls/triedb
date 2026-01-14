@@ -1306,6 +1306,16 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Resets the dirty metadata slot by copying from the active slot.
+    ///
+    /// This is used for abort/rollback after changes have been applied via `set_values()`.
+    /// It effectively discards all uncommitted changes by resetting the metadata to the
+    /// last committed state.
+    pub fn reset_dirty_slot(&self) {
+        let mut meta_manager = self.meta_manager.lock();
+        meta_manager.reset_dirty_slot();
+    }
+
     /// Returns the total number of pages in the storage engine.
     pub fn size(&self) -> u32 {
         self.page_manager.size()

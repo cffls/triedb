@@ -562,6 +562,13 @@ impl MetadataManager {
         Ok(())
     }
 
+    /// Resets the dirty slot by copying from active slot and incrementing snapshot ID.
+    ///
+    /// Used for abort/rollback scenarios where changes need to be discarded without persisting.
+    pub fn reset_dirty_slot(&mut self) {
+        self.populate_dirty_slot();
+    }
+
     /// Erases the metadata contents.
     pub fn wipe(&mut self) -> io::Result<()> {
         // Set the file length to its initial size
