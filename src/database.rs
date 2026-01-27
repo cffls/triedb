@@ -5,7 +5,9 @@ use crate::{
     metrics::DatabaseMetrics,
     page::{PageError, PageId, PageManager},
     storage::engine::{self, StorageEngine},
-    transaction::{Transaction, TransactionError, TransactionManager, UpgradableTransaction, RO, RW},
+    transaction::{
+        Transaction, TransactionError, TransactionManager, UpgradableTransaction, RO, RW,
+    },
 };
 use alloy_primitives::B256;
 use parking_lot::Mutex;
@@ -644,8 +646,7 @@ mod tests {
 
         // Use upgradable transaction
         let mut tx = db.begin_upgradable();
-        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
-            .unwrap();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone())).unwrap();
 
         // Compute root (acquires write lock)
         let computed_root = tx.compute_root().unwrap();
@@ -677,8 +678,7 @@ mod tests {
 
         // Use upgradable transaction
         let mut tx = db.begin_upgradable();
-        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
-            .unwrap();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone())).unwrap();
 
         // Compute root (acquires write lock)
         let computed_root = tx.compute_root().unwrap();
@@ -707,8 +707,7 @@ mod tests {
 
         // Use upgradable transaction
         let mut tx = db.begin_upgradable();
-        tx.set_account(AddressPath::for_address(address), Some(account.clone()))
-            .unwrap();
+        tx.set_account(AddressPath::for_address(address), Some(account.clone())).unwrap();
 
         // Abort before compute_root (no write lock was acquired)
         tx.abort().unwrap();
@@ -734,14 +733,12 @@ mod tests {
 
         // Use regular RW transaction on db1
         let mut tx1 = db1.begin_rw().unwrap();
-        tx1.set_account(AddressPath::for_address(address), Some(account.clone()))
-            .unwrap();
+        tx1.set_account(AddressPath::for_address(address), Some(account.clone())).unwrap();
         tx1.commit().unwrap();
 
         // Use upgradable transaction on db2
         let mut tx2 = db2.begin_upgradable();
-        tx2.set_account(AddressPath::for_address(address), Some(account.clone()))
-            .unwrap();
+        tx2.set_account(AddressPath::for_address(address), Some(account.clone())).unwrap();
         tx2.compute_root().unwrap();
         tx2.commit().unwrap();
 

@@ -257,12 +257,7 @@ const _: fn() = || {
 
 impl<DB: Deref<Target = Database>> UpgradableTransaction<DB> {
     pub(crate) fn new(database: DB) -> Self {
-        Self {
-            database,
-            pending_changes: HashMap::default(),
-            context: None,
-            computed: false,
-        }
+        Self { database, pending_changes: HashMap::default(), context: None, computed: false }
     }
 
     /// Accumulates an account change. No write lock is held.
